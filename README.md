@@ -33,6 +33,73 @@ Automating different parts of the development process can save time, improve qua
 - **Boosts developer productivity** by streamlining workflows.  
 
 
+Here’s an example of automating some of these workflows using GitHub Actions:
+
+```yaml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint-and-test:
+    name: Lint & Test Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Linter
+        run: npm run lint
+
+      - name: Run Tests
+        run: npm test
+
+  build-and-publish:
+    name: Build & Publish Docker Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build & Push Docker Image
+        run: |
+          docker build -t my-app:latest .
+          docker tag my-app:latest my-dockerhub-username/my-app:latest
+          docker push my-dockerhub-username/my-app:latest
+
+  notify:
+    name: Notify Team
+    runs-on: ubuntu-latest
+    needs: build-and-publish
+    steps:
+      - name: Send Notification
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data \
+          '{"text":"🚀 New deployment completed successfully!"}' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### **How This Works**
+1. **Lint & Test Code**: Runs ESLint and unit tests on every push or pull request.  
+2. **Build & Publish Docker Image**: Builds a Docker image and pushes it to Docker Hub.  
+3. **Notify Team**: Sends a message to Slack when deployment is successful.  
+
 
 
 # GitHub Actions workflow:
