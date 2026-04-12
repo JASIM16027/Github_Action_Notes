@@ -1,6 +1,8 @@
 
 # **Automating Workflows: Making Development Smoother**  
 
+<img width="991" height="465" alt="image" src="https://github.com/user-attachments/assets/2c6b6a6c-0298-448b-8b2d-d6a1a9ead7d7" />
+
 Automating different parts of the development process can save time, improve quality, and reduce errors. Here’s how automation helps:  
 
 1. **Welcoming New Contributors**  
