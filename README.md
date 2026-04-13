@@ -1,6 +1,343 @@
 
 # **Automating Workflows: Making Development Smoother**  
 
+## এই GitHub Actions Workflow — 🔍
+
+---
+
+### প্রথমে পুরো ছবিটা বুঝি
+
+```
+কেউ code push করলো
+        ↓
+Docker image build হলো
+        ↓
+AWS ECR-এ image push হলো
+        ↓
+GitOps repo update হলো (Kubernetes জানলো নতুন image আছে)
+        ↓
+AWS CodeCommit-এ backup হলো
+        ↓
+Slack-এ notification গেলো ✅ বা ❌
+```
+
+---
+
+## ১. TRIGGER — কখন চালু হবে?
+
+```yaml
+on:
+  push:
+    branches:
+      - develop
+      - master
+      - staging
+```
+
+> এই তিনটা branch-এ কেউ push করলেই workflow চালু হবে।
+
+```
+develop  → development environment
+staging  → staging environment  
+master   → production environment
+```
+
+---
+
+## ২. JOB DEFINE
+
+```yaml
+jobs:
+  build:
+    name: Build, GitOps and Slack Notification
+    runs-on: ubuntu-latest
+```
+
+> `ubuntu-latest` machine-এ সব কাজ হবে। GitHub একটা fresh Linux server দেবে।
+
+---
+
+## ৩. ENVIRONMENT VARIABLES
+
+```yaml
+env:
+  ST_ECR_REPOSITORY: ${{ vars.ST_ECR_REPOSITORY }}
+```
+> AWS ECR-এর URL। যেমন: `123456789.dkr.ecr.ap-southeast-1.amazonaws.com`
+
+```yaml
+  ST_CICD_USER: ${{ vars.ST_CICD_USER }}
+  ST_CICD_TOKEN: ${{ secrets.ST_CICD_TOKEN }}
+```
+> GitOps repo-তে push করার জন্য GitHub username ও token।
+
+```yaml
+  ST_AWS_ACCESS_KEY_ID: ${{ vars.ST_AWS_ACCESS_KEY_ID }}
+  ST_AWS_SECRET_ACCESS_KEY: ${{ secrets.ST_AWS_SECRET_ACCESS_KEY }}
+  ST_AWS_REGION: ${{ vars.ST_AWS_REGION }}
+```
+> AWS-এ login করার credentials। Region যেমন: `ap-southeast-1`
+
+```yaml
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+```
+> Slack-এ notification পাঠানোর URL।
+
+> 💡 `vars.*` = public config, `secrets.*` = sensitive/hidden data
+
+---
+
+## ৪. STEP 1 — Code নামাও
+
+```yaml
+- name: Checkout
+  uses: actions/checkout@v1
+```
+
+> GitHub runner-এ তোমার repository-র code নামিয়ে আনো।
+> এটা ছাড়া পরের কোনো কাজই হবে না।
+
+---
+
+## ৫. STEP 2 — AWS-এ Login
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v1
+  with:
+    aws-access-key-id: ${{ env.ST_AWS_ACCESS_KEY_ID }}
+    aws-secret-access-key: ${{ env.ST_AWS_SECRET_ACCESS_KEY }}
+    aws-region: ${{ env.ST_AWS_REGION }}
+```
+
+> AWS SDK কে বলছো — "এই key দিয়ে login করো"।
+> পরের সব AWS command এই credentials use করবে।
+
+---
+
+## ৬. STEP 3 — ECR-এ Login
+
+```yaml
+- name: Login to Amazon ECR
+  uses: aws-actions/amazon-ecr-login@v1
+```
+
+> ECR = AWS-এর private Docker registry।
+> Docker কে বলছো — "এই ECR-এ image push করার permission দাও"।
+
+---
+
+## ৭. STEP 4 — Docker Build & Push (সবচেয়ে গুরুত্বপূর্ণ!)
+
+```yaml
+- name: Build, tag, and push image to Amazon ECR
+  run: |
+    set -e
+```
+> `set -e` মানে — যেকোনো error হলে সাথে সাথে বন্ধ হয়ে যাও।
+
+```bash
+    declare -A branches=( 
+      ["refs/heads/develop"]="development"
+      ["refs/heads/staging"]="staging"
+      ["refs/heads/master"]="production"
+    )
+```
+> একটা map তৈরি করছে:
+> ```
+> develop branch → "development"
+> staging branch → "staging"
+> master branch  → "production"
+> ```
+
+```bash
+    PROJECTS=("flight-engine-b2c" "flight-engine-b2b")
+```
+> দুইটা project আছে — b2c (Business to Customer) এবং b2b (Business to Business)।
+> দুইটার জন্যই আলাদা image build হবে।
+
+```bash
+    for branch in "${!branches[@]}"; do
+      if [ "${GITHUB_REF}" == "$branch" ]; then
+        ENVIRONMENT=${branches[$branch]}
+        break
+      fi
+    done
+```
+> কোন branch থেকে push এলো সেটা দেখে ENVIRONMENT ঠিক করছে।
+> যেমন: `develop` থেকে push → `ENVIRONMENT=development`
+
+```bash
+    for PROJECT in "${PROJECTS[@]}"; do
+      ECR_REPO="${ST_ECR_REPOSITORY}/${ENVIRONMENT}/${PROJECT}"
+```
+> প্রতিটা project-এর জন্য ECR path বানাচ্ছে।
+> যেমন: `123456.ecr.aws/development/flight-engine-b2c`
+
+```bash
+      if ! aws ecr describe-repositories --repository-names "${ENVIRONMENT}/${PROJECT}" > /dev/null 2>&1; then
+        aws ecr create-repository --repository-name "${ENVIRONMENT}/${PROJECT}"
+      fi
+```
+> ECR-এ repository আছে কিনা check করো।
+> না থাকলে নতুন বানাও। (Auto-create!)
+
+```bash
+      docker build -t $ECR_REPO:${{ github.sha }} -f Dockerfile.${ENVIRONMENT} .
+```
+> Docker image build করো।
+> - Tag হিসেবে `github.sha` use করছে (commit hash, যেমন: `a3f8c12`)
+> - `Dockerfile.development` বা `Dockerfile.production` আলাদা file আছে
+
+```bash
+      docker push $ECR_REPO:${{ github.sha }}
+```
+> Build করা image AWS ECR-এ push করো।
+
+---
+
+## ৮. STEP 5 — GitOps Update (Kubernetes কে জানাও)
+
+```yaml
+- name: Update GitOps repository
+```
+
+> এটা হলো **GitOps pattern** — Kubernetes কে directly বলছো না।
+> বরং একটা git repo update করছো, Kubernetes সেটা দেখে নিজেই update নেয়।
+
+```bash
+    REPO_URL="https://$ST_CICD_USER:$ST_CICD_TOKEN@github.com/..."
+```
+> GitOps repo-র URL বানাচ্ছে credentials সহ।
+
+```bash
+    case ${ENVIRONMENT} in
+      development) REPO_URL="...gitops-development.git" ;;
+      staging)     REPO_URL="...gitops-staging.git" ;;
+      production)  REPO_URL="...cicd.git" ;;
+    esac
+```
+> Environment অনুযায়ী আলাদা GitOps repo:
+> ```
+> development → gitops-development repo
+> staging     → gitops-staging repo
+> production  → cicd repo
+> ```
+
+```bash
+    git clone "$REPO_URL" "$CLONE_DIR"
+```
+> GitOps repository নামিয়ে আনো।
+
+```bash
+    curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+    kustomize edit set image ${PROJECT}=$ST_ECR_REPOSITORY/${ENVIRONMENT}/${PROJECT}:${IMAGE_TAG}
+```
+> **Kustomize** = Kubernetes config update করার tool।
+> নতুন image tag দিয়ে Kubernetes deployment file update করছে।
+> এটাই বলছে Kubernetes-কে — "এই নতুন image use করো!"
+
+```bash
+    git commit -am "[Github] updating ${ENVIRONMENT} images to ${IMAGE_TAG}"
+    git push origin main
+```
+> Update commit করে push করো।
+> Kubernetes (ArgoCD/FluxCD) এই change দেখে automatically deploy করবে।
+
+---
+
+## ৯. STEP 6 — AWS CodeCommit Backup
+
+```yaml
+- name: BACKUP CODE to AWS CODE-COMMIT
+  uses: pixta-dev/repository-mirroring-action@v1
+  if: github.ref == 'refs/heads/master'
+```
+
+> শুধু **master branch**-এ push হলে চলবে।
+> পুরো repository AWS CodeCommit-এ mirror/backup করছে।
+> কারণ: GitHub down হলেও code যেন থাকে!
+
+```yaml
+  with:
+    target_repo_url: ssh://git-codecommit.us-east-1.amazonaws.com/...
+    ssh_private_key: ${{ secrets.CODECOMMITSSHKEY }}
+```
+> SSH key দিয়ে AWS CodeCommit-এ connect করছে।
+
+---
+
+## ১০. STEP 7 — Slack Notification
+
+```yaml
+- uses: 8398a7/action-slack@v3
+  with:
+    status: ${{ job.status }}
+    fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+  if: always()
+```
+
+> `if: always()` — সফল হোক বা fail হোক, **সবসময়** Slack-এ message যাবে।
+> Slack-এ যা দেখাবে:
+> ```
+> ✅ Build successful!
+> Repo: flight-engine
+> Commit: a3f8c12
+> Author: John
+> Time taken: 4m 32s
+> ```
+
+---
+
+## পুরো Flow এক নজরে
+
+```
+git push (develop/staging/master)
+          │
+          ▼
+    Code Checkout
+          │
+          ▼
+    AWS Login & ECR Login
+          │
+          ▼
+    Docker Build
+    (b2c + b2b দুইটাই)
+          │
+          ▼
+    ECR-এ Image Push
+    (sha tag সহ)
+          │
+          ▼
+    GitOps Repo Update
+    (Kustomize দিয়ে)
+          │
+          ▼
+    Kubernetes দেখে
+    নতুন image deploy করে
+          │
+          ├── master হলে → CodeCommit Backup
+          │
+          ▼
+    Slack Notification
+    (success বা failure)
+```
+
+---
+
+## এই workflow-এ কোন কোন best practice আছে?
+
+| Practice | কোথায় |
+|---|---|
+| Secret আলাদা রাখা | `secrets.*` use |
+| Per-environment আলাদা config | branches map |
+| Immutable image tag | `github.sha` use |
+| Auto ECR repo create | describe → create |
+| GitOps pattern | Kustomize update |
+| Backup strategy | CodeCommit mirror |
+| Always notify | `if: always()` |
+
+
 <img width="991" height="465" alt="image" src="https://github.com/user-attachments/assets/2c6b6a6c-0298-448b-8b2d-d6a1a9ead7d7" />
 
 Automating different parts of the development process can save time, improve quality, and reduce errors. Here’s how automation helps:  
